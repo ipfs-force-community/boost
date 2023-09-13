@@ -169,7 +169,12 @@ func dealCmdAction(cctx *cli.Context, isOnline bool) error {
 		return fmt.Errorf("failed to connect to peer %s: %w", addrInfo.ID, err)
 	}
 
-	x, err := n.Host.Peerstore().FirstSupportedProtocol(addrInfo.ID, DealProtocolv120)
+	dealProtocols := []protocol.ID{
+		storagemarket.DealProtocolID111,
+		storagemarket.DealProtocolID110,
+		storagemarket.DealProtocolID101,
+	}
+	x, err := n.Host.Peerstore().FirstSupportedProtocol(addrInfo.ID, dealProtocols...)
 	if err != nil {
 		return fmt.Errorf("getting protocols for peer %s: %w", addrInfo.ID, err)
 	}
@@ -283,11 +288,6 @@ func dealCmdAction(cctx *cli.Context, isOnline bool) error {
 
 	log.Debugw("about to submit deal proposal", "uuid", dealUuid.String())
 
-	dealProtocols := []protocol.ID{
-		storagemarket.DealProtocolID111,
-		storagemarket.DealProtocolID110,
-		storagemarket.DealProtocolID101,
-	}
 	s, err := n.Host.NewStream(ctx, addrInfo.ID, dealProtocols...)
 	if err != nil {
 		return fmt.Errorf("failed to open stream to peer %s: %w", addrInfo.ID, err)
