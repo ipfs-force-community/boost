@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/filecoin-project/boost-gfm/storagemarket"
+	"github.com/filecoin-project/boost-gfm/storagemarket/network"
 	bcli "github.com/filecoin-project/boost/cli"
 	clinode "github.com/filecoin-project/boost/cli/node"
 	"github.com/filecoin-project/boost/cmd"
@@ -14,6 +16,7 @@ import (
 	types2 "github.com/filecoin-project/boost/transport/types"
 	"github.com/filecoin-project/go-address"
 	cborutil "github.com/filecoin-project/go-cbor-util"
+	network3 "github.com/filecoin-project/go-fil-markets/storagemarket/network"
 	"github.com/filecoin-project/go-state-types/abi"
 	"github.com/filecoin-project/go-state-types/big"
 	"github.com/filecoin-project/go-state-types/builtin/v9/market"
@@ -23,6 +26,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/ipfs/go-cid"
 	inet "github.com/libp2p/go-libp2p/core/network"
+	network2 "github.com/libp2p/go-libp2p/core/network"
+	"github.com/libp2p/go-libp2p/core/protocol"
 	"github.com/urfave/cli/v2"
 )
 
@@ -164,7 +169,12 @@ func dealCmdAction(cctx *cli.Context, isOnline bool) error {
 		return fmt.Errorf("failed to connect to peer %s: %w", addrInfo.ID, err)
 	}
 
-	x, err := n.Host.Peerstore().FirstSupportedProtocol(addrInfo.ID, DealProtocolv120)
+	dealProtocols := []protocol.ID{
+		storagemarket.DealProtocolID111,
+		storagemarket.DealProtocolID110,
+		storagemarket.DealProtocolID101,
+	}
+	x, err := n.Host.Peerstore().FirstSupportedProtocol(addrInfo.ID, dealProtocols...)
 	if err != nil {
 		return fmt.Errorf("getting protocols for peer %s: %w", addrInfo.ID, err)
 	}
@@ -266,32 +276,43 @@ func dealCmdAction(cctx *cli.Context, isOnline bool) error {
 		return fmt.Errorf("failed to create a deal proposal: %w", err)
 	}
 
-	dealParams := types.DealParams{
-		DealUUID:           dealUuid,
-		ClientDealProposal: *dealProposal,
-		DealDataRoot:       rootCid,
-		IsOffline:          !isOnline,
-		Transfer:           transfer,
-		RemoveUnsealedCopy: cctx.Bool("remove-unsealed-copy"),
-		SkipIPNIAnnounce:   cctx.Bool("skip-ipni-announce"),
-	}
+	// dealParams := types.DealParams{
+	// 	DealUUID:           dealUuid,
+	// 	ClientDealProposal: *dealProposal,
+	// 	DealDataRoot:       rootCid,
+	// 	IsOffline:          !isOnline,
+	// 	Transfer:           transfer,
+	// 	RemoveUnsealedCopy: cctx.Bool("remove-unsealed-copy"),
+	// 	SkipIPNIAnnounce:   cctx.Bool("skip-ipni-announce"),
+	// }
 
 	log.Debugw("about to submit deal proposal", "uuid", dealUuid.String())
 
-	s, err := n.Host.NewStream(ctx, addrInfo.ID, DealProtocolv120)
+	s, err := n.Host.NewStream(ctx, addrInfo.ID, dealProtocols...)
 	if err != nil {
 		return fmt.Errorf("failed to open stream to peer %s: %w", addrInfo.ID, err)
 	}
 	defer s.Close()
 
-	var resp types.DealResponse
-	if err := doRpc(ctx, s, &dealParams, &resp); err != nil {
-		return fmt.Errorf("send proposal rpc: %w", err)
-	}
+	// var resp types.DealResponse
+	// if err := doRpc(ctx, s, &dealParams, &resp); err != nil {
+	// 	return fmt.Errorf("send proposal rpc: %w", err)
+	// }
 
-	if !resp.Accepted {
-		return fmt.Errorf("deal proposal rejected: %s", resp.Message)
+	// if !resp.Accepted {
+	// 	return fmt.Errorf("deal proposal rejected: %s", resp.Message)
+	// }
+	ref := &storagemarket.DataRef{
+		TransferType: storagemarket.TTManual,
+		Root:         rootCid,
+		PieceCid:     &dealProposal.Proposal.PieceCID,
+		PieceSize:    dealProposal.Proposal.PieceSize.Unpadded(),
 	}
+	procid, err := sendPropose(s, dealProposal, ref)
+	if err != nil {
+		return err
+	}
+	fmt.Println("proposal cid:", procid)
 
 	if cctx.Bool("json") {
 		out := map[string]interface{}{
@@ -391,4 +412,36 @@ func doRpc(ctx context.Context, s inet.Stream, req interface{}, resp interface{}
 	case <-ctx.Done():
 		return ctx.Err()
 	}
+}
+
+func sendPropose(stream network2.Stream, dealProposal *market.ClientDealProposal, dataRef *storagemarket.DataRef) (*cid.Cid, error) {
+	if err := cborutil.WriteCborRPC(stream, &network.Proposal{
+		FastRetrieval: true,
+		DealProposal:  dealProposal,
+		Piece:         dataRef,
+	}); err != nil {
+		return nil, fmt.Errorf("sending deal proposal failed: %w", err)
+	}
+
+	resp := network3.SignedResponse{}
+	err := cborutil.ReadCborRPC(stream, &resp)
+	if err != nil {
+		return nil, fmt.Errorf("reading proposal response failed: %w", err)
+	}
+
+	dealProposalIpld, err := cborutil.AsIpld(dealProposal)
+	if err != nil {
+		return nil, fmt.Errorf("serializing proposal node failed: %w", err)
+	}
+	proposalCID := dealProposalIpld.Cid()
+
+	if !proposalCID.Equals(resp.Response.Proposal) {
+		return nil, fmt.Errorf("provider returned proposal cid %s but we expected %s", resp.Response.Proposal, dealProposalIpld.Cid())
+	}
+
+	if resp.Response.State != storagemarket.StorageDealWaitingForData {
+		return nil, fmt.Errorf("provider returned unexpected state %d for proposal %s, with message: %s", resp.Response.State, resp.Response.Proposal, resp.Response.Message)
+	}
+
+	return &proposalCID, nil
 }
